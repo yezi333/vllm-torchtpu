@@ -238,6 +238,8 @@ python-version = "3.12"
 # With no environment to query, every import below is unresolvable. Listing
 # them makes an unresolved import degrade to `Any` instead of erroring.
 ignore-missing-imports = [
+    # Optional wheel used only by the opt-in gate/up experiment.
+    "pallas_matmul_subset", "pallas_matmul_subset.*",
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
     "google.protobuf", "google.protobuf.*",

@@ -34,6 +34,7 @@ and uses our native TorchTPU + Pallas kernels.
 4. apply() routes to our TPU Pallas local-topk MoE kernels
 """
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -143,6 +145,56 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
 
+class VllmPallasMatmulLinearMethod(VllmUnquantizedLinearMethod):
+    """Opt-in gate/up experiment; the default dense method stays unchanged."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._matmul_op: Callable | None = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer = cast("TpuLinear", layer)
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            raise ValueError("Custom matmul requires canonical [K,N] weights")
+        super().process_weights_after_loading(layer)
+        if (
+            layer.tp_size != 1
+            or tuple(layer.weight.shape) != (1024, 6144)
+            or layer.weight.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "TPU_QWEN3_CUSTOM_MATMUL requires TP=1, BF16 and "
+                f"[1024,6144] weights; got TP={layer.tp_size}, "
+                f"shape={tuple(layer.weight.shape)}, dtype={layer.weight.dtype}"
+            )
+        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            raise ValueError("Custom matmul weights have not been transposed")
+        from vllm_torchtpu.layers.adapter.pallas_matmul import get_pallas_matmul_op
+
+        self._matmul_op = get_pallas_matmul_op()
+        logger.info(
+            "[custom-matmul] Enabled packaged Pallas matmul for %s, shape=%s",
+            layer.prefix,
+            tuple(layer.weight.shape),
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        layer = cast("TpuLinear", layer)
+        if self._matmul_op is None:
+            raise RuntimeError("Load custom matmul weights before calling apply")
+        if bias is not None:
+            raise ValueError("Custom gate/up matmul does not support bias")
+        if x.ndim < 2 or x.shape[-1] != 1024 or x.dtype != torch.bfloat16:
+            raise ValueError("Custom matmul requires BF16 input [...,M,1024]")
+        output = self._matmul_op(x.reshape(-1, x.shape[-1]), layer.weight)
+        return output.reshape(*x.shape[:-1], layer.weight.shape[-1])
+
+
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     """
@@ -191,6 +243,12 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
+            # Explicit opt-in scope for the gate/up kernel A/B experiment.
+            if envs.TPU_QWEN3_CUSTOM_MATMUL and prefix.endswith(".mlp.gate_up_proj"):
+                if should_quantize_on_load(prefix):
+                    raise ValueError("Disable load-time quantization for custom matmul")
+                return VllmPallasMatmulLinearMethod()
+
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
             if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):

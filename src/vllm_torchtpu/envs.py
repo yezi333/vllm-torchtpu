@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
+    TPU_QWEN3_CUSTOM_MATMUL: bool = False
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
@@ -471,6 +472,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm", ["shm"]
     ),
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
+    "TPU_QWEN3_CUSTOM_MATMUL": env_bool("TPU_QWEN3_CUSTOM_MATMUL"),
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     # Runtime block size for dense linear weight requantization.
     "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
